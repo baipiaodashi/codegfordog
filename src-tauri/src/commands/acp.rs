@@ -6323,9 +6323,9 @@ pub(crate) async fn acp_antigravity_add_account_start_core(
             if let Some(ref mut auth_url) = started.auth_url {
                 if !auth_url.contains("prompt=") {
                     if auth_url.contains('?') {
-                        auth_url.push_str("&prompt=select_account");
+                        auth_url.push_str("&prompt=select_account%20consent");
                     } else {
-                        auth_url.push_str("?prompt=select_account");
+                        auth_url.push_str("?prompt=select_account%20consent");
                     }
                 }
             }
@@ -6346,7 +6346,7 @@ pub(crate) async fn acp_antigravity_check_pending_login_core(
 
 pub(crate) async fn acp_antigravity_list_accounts_core(
 ) -> Result<crate::acp::antigravity_accounts::AntigravityAccountsState, AcpError> {
-    crate::acp::antigravity_accounts::sync_accounts_state().await
+    crate::acp::antigravity_accounts::get_or_sync_accounts_state().await
 }
 
 pub(crate) async fn acp_antigravity_switch_account_core(

@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use std::sync::Mutex as StdMutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -16,24 +17,33 @@ const USER_AGENT: &str = "antigravity/acp/1.2.1 (aidev_client; os_type=windows; 
 const CLOUDCODE_ENDPOINT: &str = "https://daily-cloudcode-pa.googleapis.com";
 
 static PENDING_LOGINS: StdMutex<Option<HashMap<String, PathBuf>>> = StdMutex::new(None);
+static ACCOUNTS_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AntigravityAccount {
     pub id: String,
     pub email: String,
+    #[serde(default)]
     pub name: Option<String>,
+    #[serde(default)]
     pub picture: Option<String>,
     pub token: serde_json::Value,
+    #[serde(default)]
     pub is_active: bool,
+    #[serde(default)]
     pub added_at: i64,
+    #[serde(default)]
     pub last_used_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct AntigravityAccountsState {
+    #[serde(default)]
     pub active_account_id: Option<String>,
+    #[serde(default)]
     pub accounts: Vec<AntigravityAccount>,
 }
 
@@ -81,33 +91,132 @@ pub fn accounts_file_path() -> PathBuf {
     resolve_antigravity_acp_dir().join(ACCOUNTS_FILENAME)
 }
 
+pub fn backup_file_path() -> PathBuf {
+    resolve_antigravity_acp_dir().join(format!("{ACCOUNTS_FILENAME}.bak"))
+}
+
 pub fn token_file_path() -> PathBuf {
     resolve_antigravity_acp_dir().join(TOKEN_FILENAME)
 }
 
 pub fn read_accounts_state_from_disk() -> AntigravityAccountsState {
-    let path = accounts_file_path();
-    if !path.exists() {
-        return AntigravityAccountsState::default();
-    }
-    match std::fs::read_to_string(&path) {
-        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
-        Err(e) => {
-            warn!("[ACP][AntigravityAccounts] Failed to read {}: {e}", path.display());
-            AntigravityAccountsState::default()
+    let main_path = accounts_file_path();
+    let bak_path = backup_file_path();
+
+    let parse_file = |path: &Path| -> Option<AntigravityAccountsState> {
+        if !path.exists() {
+            return None;
         }
+        match std::fs::read_to_string(path) {
+            Ok(content) => {
+                let trimmed = content.trim();
+                if trimmed.is_empty() {
+                    warn!("[ACP][AntigravityAccounts] File {} is empty", path.display());
+                    return None;
+                }
+                match serde_json::from_str::<AntigravityAccountsState>(trimmed) {
+                    Ok(mut state) => {
+                        for acc in &mut state.accounts {
+                            acc.is_active = state.active_account_id.as_deref() == Some(&acc.id);
+                        }
+                        Some(state)
+                    }
+                    Err(e) => {
+                        warn!(
+                            "[ACP][AntigravityAccounts] Failed to parse accounts JSON in {}: {e}",
+                            path.display()
+                        );
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("[ACP][AntigravityAccounts] Failed to read {}: {e}", path.display());
+                None
+            }
+        }
+    };
+
+    if let Some(state) = parse_file(&main_path) {
+        // If main file parsed but has 0 accounts, check if backup has accounts
+        if state.accounts.is_empty() {
+            if let Some(bak_state) = parse_file(&bak_path) {
+                if !bak_state.accounts.is_empty() {
+                    warn!(
+                        "[ACP][AntigravityAccounts] Main file has 0 accounts, recovering {} accounts from backup {}",
+                        bak_state.accounts.len(),
+                        bak_path.display()
+                    );
+                    let _ = save_accounts_state_to_disk(&bak_state);
+                    return bak_state;
+                }
+            }
+        }
+        return state;
     }
+
+    // Main file missing or failed to parse, try backup
+    if let Some(bak_state) = parse_file(&bak_path) {
+        warn!(
+            "[ACP][AntigravityAccounts] Recovering {} accounts from backup {}",
+            bak_state.accounts.len(),
+            bak_path.display()
+        );
+        let _ = save_accounts_state_to_disk(&bak_state);
+        return bak_state;
+    }
+
+    AntigravityAccountsState::default()
 }
 
 pub fn save_accounts_state_to_disk(state: &AntigravityAccountsState) -> Result<(), AcpError> {
     let path = accounts_file_path();
+    let bak_path = backup_file_path();
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     let content = serde_json::to_string_pretty(state)
         .map_err(|e| AcpError::Protocol(format!("Failed to serialize accounts state: {e}")))?;
-    std::fs::write(&path, content)
-        .map_err(|e| AcpError::Protocol(format!("Failed to write {}: {e}", path.display())))?;
+
+    // Atomic write via temporary file
+    let tmp_path = path.with_extension(format!("tmp.{}", uuid::Uuid::new_v4()));
+    if let Err(e) = std::fs::write(&tmp_path, &content) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(AcpError::Protocol(format!(
+            "Failed to write temp accounts file {}: {e}",
+            tmp_path.display()
+        )));
+    }
+
+    #[cfg(windows)]
+    {
+        if std::fs::rename(&tmp_path, &path).is_err() {
+            let _ = std::fs::remove_file(&path);
+            if let Err(e) = std::fs::rename(&tmp_path, &path) {
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(AcpError::Protocol(format!(
+                    "Failed to replace {}: {e}",
+                    path.display()
+                )));
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        if let Err(e) = std::fs::rename(&tmp_path, &path) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(AcpError::Protocol(format!(
+                "Failed to replace {}: {e}",
+                path.display()
+            )));
+        }
+    }
+
+    // Update backup file when accounts is non-empty
+    if !state.accounts.is_empty() {
+        let _ = std::fs::write(&bak_path, &content);
+    }
+
     Ok(())
 }
 
@@ -115,6 +224,10 @@ pub fn save_accounts_state_to_disk(state: &AntigravityAccountsState) -> Result<(
 /// Prevents the Antigravity ACP process from starting with a missing token and prompting
 /// for authorization in the browser on startup.
 pub fn ensure_active_token_on_disk() {
+    ensure_active_token_on_disk_locked();
+}
+
+fn ensure_active_token_on_disk_locked() {
     let token_path = token_file_path();
     let state = read_accounts_state_from_disk();
     if state.accounts.is_empty() {
@@ -189,6 +302,7 @@ pub fn remove_pending_login(handle: &str) -> Option<PathBuf> {
 pub async fn check_and_consume_login_if_ready(
     handle: &str,
 ) -> Result<Option<AntigravityAccountsState>, AcpError> {
+    let _guard = ACCOUNTS_LOCK.lock().await;
     let temp_dir = {
         let lock = PENDING_LOGINS.lock().unwrap();
         match lock.as_ref().and_then(|m| m.get(handle)).cloned() {
@@ -218,8 +332,9 @@ pub async fn check_and_consume_login_if_ready(
     // Cancel helper child in antigravity_login
     let _ = crate::acp::antigravity_login::cancel(handle).await;
 
-    // Ingest the new account
-    let state = ingest_new_token(token_json).await?;
+    // Ingest the new account into existing state
+    let mut state = read_accounts_state_from_disk();
+    let state = ingest_new_token_locked(token_json, &mut state).await?;
 
     // Cleanup temp dir
     let _ = std::fs::remove_dir_all(&temp_dir);
@@ -229,8 +344,16 @@ pub async fn check_and_consume_login_if_ready(
 
 /// Ingests a new token into `antigravity_accounts.json`
 pub async fn ingest_new_token(token_json: serde_json::Value) -> Result<AntigravityAccountsState, AcpError> {
-    let now = now_secs();
+    let _guard = ACCOUNTS_LOCK.lock().await;
     let mut state = read_accounts_state_from_disk();
+    ingest_new_token_locked(token_json, &mut state).await
+}
+
+async fn ingest_new_token_locked(
+    token_json: serde_json::Value,
+    state: &mut AntigravityAccountsState,
+) -> Result<AntigravityAccountsState, AcpError> {
+    let now = now_secs();
 
     let mut email = None;
     let mut name = None;
@@ -298,9 +421,9 @@ pub async fn ingest_new_token(token_json: serde_json::Value) -> Result<Antigravi
         info!("[ACP][AntigravityAccounts] Updated existing account {}", final_email);
     }
 
-    save_accounts_state_to_disk(&state)?;
-    ensure_active_token_on_disk();
-    Ok(state)
+    save_accounts_state_to_disk(state)?;
+    ensure_active_token_on_disk_locked();
+    Ok(state.clone())
 }
 
 /// Refresh Google OAuth access token from a token JSON blob
@@ -394,9 +517,22 @@ pub async fn fetch_user_info(access_token: &str) -> Result<(String, String, Opti
     Ok((id, email, name, picture))
 }
 
+/// Read accounts state. If accounts already exist, return immediately without touching disk.
+/// If empty, fall back to `sync_accounts_state` to discover token.
+pub async fn get_or_sync_accounts_state() -> Result<AntigravityAccountsState, AcpError> {
+    let _guard = ACCOUNTS_LOCK.lock().await;
+    let state = read_accounts_state_from_disk();
+    if !state.accounts.is_empty() {
+        return Ok(state);
+    }
+    drop(_guard);
+    sync_accounts_state().await
+}
+
 /// Ensure accounts state is synchronized with existing acp_token.json file
 pub async fn sync_accounts_state() -> Result<AntigravityAccountsState, AcpError> {
-    ensure_active_token_on_disk();
+    let _guard = ACCOUNTS_LOCK.lock().await;
+    ensure_active_token_on_disk_locked();
     let mut state = read_accounts_state_from_disk();
     let token_path = token_file_path();
 
@@ -404,11 +540,15 @@ pub async fn sync_accounts_state() -> Result<AntigravityAccountsState, AcpError>
         if let Ok(token_content) = std::fs::read_to_string(&token_path) {
             if let Ok(token_json) = serde_json::from_str::<serde_json::Value>(&token_content) {
                 let rtoken = token_json.get("refresh_token").and_then(|v| v.as_str()).unwrap_or("");
-                
-                // If this token matches one of our known accounts, simply mark it active
-                let known_idx = state.accounts.iter().position(|a| {
-                    a.token.get("refresh_token").and_then(|v| v.as_str()) == Some(rtoken)
-                });
+
+                // 1. Check if token matches a known account by refresh_token
+                let known_idx = if !rtoken.is_empty() {
+                    state.accounts.iter().position(|a| {
+                        a.token.get("refresh_token").and_then(|v| v.as_str()) == Some(rtoken)
+                    })
+                } else {
+                    None
+                };
 
                 if let Some(idx) = known_idx {
                     let acc_id = state.accounts[idx].id.clone();
@@ -416,12 +556,41 @@ pub async fn sync_accounts_state() -> Result<AntigravityAccountsState, AcpError>
                     for (i, acc) in state.accounts.iter_mut().enumerate() {
                         acc.is_active = i == idx;
                     }
+                    // Keep latest token from disk
+                    state.accounts[idx].token = token_json;
                     let _ = save_accounts_state_to_disk(&state);
                     return Ok(state);
                 }
 
-                // If not in state yet, ingest it
-                return ingest_new_token(token_json).await;
+                // 2. If state already has accounts, do NOT drop them! Check by user info before assuming new.
+                if !state.accounts.is_empty() {
+                    if let Ok(access_token) = refresh_access_token(&token_json).await {
+                        if let Ok((id, em, nm, pic)) = fetch_user_info(&access_token).await {
+                            if let Some(pos) = state.accounts.iter().position(|a| a.email == em || a.id == id) {
+                                state.accounts[pos].token = token_json;
+                                state.accounts[pos].is_active = true;
+                                if nm.is_some() {
+                                    state.accounts[pos].name = nm;
+                                }
+                                if pic.is_some() {
+                                    state.accounts[pos].picture = pic;
+                                }
+                                let active_id = state.accounts[pos].id.clone();
+                                state.active_account_id = Some(active_id);
+                                for (i, acc) in state.accounts.iter_mut().enumerate() {
+                                    acc.is_active = i == pos;
+                                }
+                                let _ = save_accounts_state_to_disk(&state);
+                                return Ok(state);
+                            }
+                        }
+                    }
+                    // It's a token for an account not yet in state: merge it without dropping existing accounts
+                    return ingest_new_token_locked(token_json, &mut state).await;
+                }
+
+                // 3. State has 0 accounts: ingest initial account from disk token
+                return ingest_new_token_locked(token_json, &mut state).await;
             }
         }
     }
@@ -435,6 +604,7 @@ pub async fn sync_accounts_state() -> Result<AntigravityAccountsState, AcpError>
 
 /// Switch active account
 pub async fn switch_account(account_id: &str) -> Result<AntigravityAccountsState, AcpError> {
+    let _guard = ACCOUNTS_LOCK.lock().await;
     let mut state = read_accounts_state_from_disk();
     let target = state
         .accounts
@@ -465,6 +635,7 @@ pub async fn switch_account(account_id: &str) -> Result<AntigravityAccountsState
 
 /// Delete an account
 pub async fn delete_account(account_id: &str) -> Result<AntigravityAccountsState, AcpError> {
+    let _guard = ACCOUNTS_LOCK.lock().await;
     let mut state = read_accounts_state_from_disk();
     let was_active = state.active_account_id.as_deref() == Some(account_id);
 
@@ -508,7 +679,10 @@ pub async fn finish_new_account_login() -> Result<AntigravityAccountsState, AcpE
 /// Fetch quota summary for the specified account or active account
 pub async fn fetch_account_quota(account_id: Option<&str>) -> AntigravityQuotaSummary {
     let now = now_secs();
-    let state = read_accounts_state_from_disk();
+    let state = {
+        let _guard = ACCOUNTS_LOCK.lock().await;
+        read_accounts_state_from_disk()
+    };
 
     let target_token = if let Some(id) = account_id {
         state.accounts.iter().find(|a| a.id == id).map(|a| (a.email.clone(), a.token.clone()))
